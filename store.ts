@@ -2,7 +2,8 @@
 // Everything lives in process memory only (no filesystem, no clock-derived ids), so two runs on
 // the same seed behave identically as long as requests arrive in the same order.
 
-import { GitObject, GitObjectType, hashObject, parseCommit, parseTree, isObjectId } from './git.ts';
+import type { GitObject, GitObjectType } from './git.ts';
+import { hashObject, parseCommit, parseTree, isObjectId } from './git.ts';
 
 export interface RepoRecord {
   id: number;

@@ -4,15 +4,14 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import type { GitObject } from './git.ts';
 import {
-  GitObject, applyDelta, buildCommit, buildTree, decodePktLines, encodeLines,
+  applyDelta, buildCommit, buildTree, decodePktLines, encodeLines,
   encodePktLine, isObjectId, parseCommit, parseTag, parseTree, pktDelim, pktFlush,
   readPack, writePack, ZERO_OID,
 } from './git.ts';
-import {
-  CommentRecord, IssueRecord, PullRecord, RepoRecord, Store, boundedReachable, depthClosure,
-  putObject, reachable, treeAndBlobsOf,
-} from './store.ts';
+import type { CommentRecord, IssueRecord, PullRecord, RepoRecord } from './store.ts';
+import { Store, boundedReachable, depthClosure, putObject, reachable, treeAndBlobsOf } from './store.ts';
 
 function buildTagShim(fields: { object: string; type: 'commit'; tag: string; tagger: string; message: string }): Buffer {
   return Buffer.from(`object ${fields.object}\ntype ${fields.type}\ntag ${fields.tag}\ntagger ${fields.tagger}\n\n${fields.message}`, 'utf8');
