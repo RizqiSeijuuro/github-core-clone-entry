@@ -435,9 +435,9 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       const slice = all.slice(start, start + perPage);
       const headers: Record<string, string> = {};
       if (start + perPage < all.length) {
-        const base = new URL(`http://x${path}`);
-        headers.link = `<${API_BASE_PLACEHOLDER}/user/repos?per_page=${perPage}&page=${page + 1}>; rel="next"`;
-        void base;
+        const proto = (req.headers['x-forwarded-proto'] as string) ?? 'http';
+        const host = req.headers.host ?? '127.0.0.1';
+        headers.link = `<${proto}://${host}${API_BASE_PLACEHOLDER}/user/repos?per_page=${perPage}&page=${page + 1}>; rel="next"`;
       }
       sendJson(res, 200, slice.map(repoJson), headers);
       return;
@@ -516,9 +516,9 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
     const contentsMatch = /^\/contents\/(.+)$/.exec(rest);
     if (contentsMatch) {
       const filePath = decodeURIComponent(contentsMatch[1]);
-      const branch = query.get('ref') ?? repo.defaultBranch;
-      const tip = repo.refs.get(`refs/heads/${branch}`);
       if (method === 'GET') {
+        const branch = query.get('ref') ?? repo.defaultBranch;
+        const tip = repo.refs.get(`refs/heads/${branch}`);
         if (!tip) { notFound(res); return; }
         const commit = parseCommit(repo.objects.get(tip)!.data);
         const found = walkTree(repo, commit.tree, filePath);
@@ -536,6 +536,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         const body = await readBody(req);
         let json: Record<string, unknown> = {};
         try { json = JSON.parse(body.toString('utf8') || '{}'); } catch { badRequest(res); return; }
+        const branch = typeof json.branch === 'string' && json.branch ? json.branch : repo.defaultBranch;
+        const tip = repo.refs.get(`refs/heads/${branch}`);
         const contentB64 = typeof json.content === 'string' ? json.content : '';
         const message = typeof json.message === 'string' ? json.message : 'update';
         const expectedSha = typeof json.sha === 'string' ? json.sha : undefined;
@@ -561,10 +563,12 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         return;
       }
       if (method === 'DELETE') {
-        if (!tip) { notFound(res); return; }
         const body = await readBody(req);
         let json: Record<string, unknown> = {};
         try { json = JSON.parse(body.toString('utf8') || '{}'); } catch { /* optional body */ }
+        const branch = typeof json.branch === 'string' && json.branch ? json.branch : repo.defaultBranch;
+        const tip = repo.refs.get(`refs/heads/${branch}`);
+        if (!tip) { notFound(res); return; }
         const message = typeof json.message === 'string' ? json.message : 'delete';
         const commit = parseCommit(repo.objects.get(tip)!.data);
         const newTree = deleteFromTree(repo, commit.tree, filePath);
@@ -704,16 +708,15 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       if (pull.merged) { sendJson(res, 200, { sha: pull.mergeCommitSha, merged: true, message: 'Pull Request already merged' }); return; }
       const currentBase = repo.refs.get(`refs/heads/${pull.base}`);
       if (currentBase !== pull.baseSha) {
-        // base moved beyond the PR's recorded base: only a true fast-forward squash is supported
-        const anc = reachable(repo, [currentBase ?? '']);
-        if (!currentBase || !anc.has(pull.baseSha)) { sendJson(res, 405, { message: 'Pull Request is not mergeable' }); return; }
+        // The base branch moved since the PR was opened: require an up-to-date base, as a
+        // conservative (and deterministic) stand-in for real merge-conflict detection.
+        sendJson(res, 405, { message: 'Pull Request is not mergeable' });
+        return;
       }
       const baseTip = repo.refs.get(`refs/heads/${pull.base}`)!;
       const baseCommit = parseCommit(repo.objects.get(baseTip)!.data);
       const headCommit = parseCommit(repo.objects.get(pull.headSha)!.data);
-      if (baseCommit.tree === headCommit.tree) {
-        // nothing to merge: already identical, treat as conflict-free no-op squash
-      }
+      void baseCommit;
       const message = `Merge pull request #${n} from ${pull.head}\n\n${pull.title}\n`;
       const commitOid = putObject(repo, 'commit', buildCommit({
         tree: headCommit.tree, parents: [baseTip], message,
