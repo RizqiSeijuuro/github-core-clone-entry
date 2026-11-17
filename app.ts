@@ -506,7 +506,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         const obj = repo.objects.get(cursor)!;
         if (obj.type !== 'commit') break;
         const c = parseCommit(obj.data);
-        out.push({ sha: cursor, commit: { message: c.message, author: { name: c.author }, committer: { name: c.committer } } });
+        out.push({ sha: cursor, commit: { message: c.message.replace(/\n+$/, ''), author: { name: c.author }, committer: { name: c.committer } } });
         cursor = c.parents[0];
       }
       sendJson(res, 200, out);
@@ -559,7 +559,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
           committer: `${AUTH_LOGIN} <${AUTH_LOGIN}@example.invalid> 1735689600 +0000`,
         }));
         repo.refs.set(`refs/heads/${branch}`, commitOid);
-        sendJson(res, tip ? 200 : 201, { content: { sha: blobOid, encoding: 'base64' }, commit: { sha: commitOid } });
+        sendJson(res, existing ? 200 : 201, { content: { sha: blobOid, encoding: 'base64' }, commit: { sha: commitOid } });
         return;
       }
       if (method === 'DELETE') {
@@ -791,10 +791,13 @@ function gqlIssueNode(repo: RepoRecord, issue: IssueRecord): Record<string, unkn
   return { id: `issue:${repo.owner}/${repo.name}#${issue.number}`, number: issue.number, title: issue.title, state: issue.state.toUpperCase(), body: issue.body };
 }
 function gqlPullNode(repo: RepoRecord, pull: PullRecord): Record<string, unknown> {
+  const baseCommit = repo.objects.has(pull.baseSha) ? parseCommit(repo.objects.get(pull.baseSha)!.data) : null;
+  const headCommit = repo.objects.has(pull.headSha) ? parseCommit(repo.objects.get(pull.headSha)!.data) : null;
+  const files = baseCommit && headCommit ? diffPaths(repo, baseCommit.tree, headCommit.tree) : [];
   return {
     id: `pr:${repo.owner}/${repo.name}#${pull.number}`, number: pull.number, headRefName: pull.head, baseRefName: pull.base,
     mergeable: 'MERGEABLE', state: pull.merged ? 'MERGED' : pull.state.toUpperCase(), merged: pull.merged,
-    files: { nodes: [] },
+    files: { nodes: files.map((f) => ({ path: f.path })) },
   };
 }
 function gqlRepoNode(repo: RepoRecord): Record<string, unknown> {
@@ -812,63 +815,148 @@ const INTROSPECTION_TYPES: Record<string, { kind: string; fields?: string[]; enu
   SearchType: { kind: 'ENUM', enumValues: ['ISSUE', 'REPOSITORY', 'USER', 'DISCUSSION'] },
 };
 
-function introspectType(name: string): Record<string, unknown> | null {
+function typeFieldsResult(name: string): Record<string, unknown> | null {
   const t = INTROSPECTION_TYPES[name];
   if (!t) return null;
-  if (t.kind === 'ENUM') return { name, kind: 'ENUM', enumValues: t.enumValues!.map((v) => ({ name: v })) };
-  return { name, kind: 'OBJECT', fields: t.fields!.map((f) => ({ name: f })) };
+  if (t.kind === 'ENUM') return { enumValues: t.enumValues!.map((v) => ({ name: v })) };
+  return { fields: t.fields!.map((f) => ({ name: f })) };
 }
 
-/** Extremely small GraphQL-ish executor: enough for the fixed documents gh / github-mcp-server send. */
+function findIssueById(id: string): { repo: RepoRecord; issue: IssueRecord } | null {
+  const m = /^issue:([^/]+)\/([^#]+)#(\d+)$/.exec(id);
+  if (!m) return null;
+  const repo = store.get(m[1], m[2]);
+  if (!repo) return null;
+  const issue = repo.issues.get(Number(m[3]));
+  return issue ? { repo, issue } : null;
+}
+function findPullById(id: string): { repo: RepoRecord; pull: PullRecord } | null {
+  const m = /^pr:([^/]+)\/([^#]+)#(\d+)$/.exec(id);
+  if (!m) return null;
+  const repo = store.get(m[1], m[2]);
+  if (!repo) return null;
+  const pull = repo.pulls.get(Number(m[3]));
+  return pull ? { repo, pull } : null;
+}
+function findRepoById(id: string): RepoRecord | null {
+  const m = /^repo:([^/]+)\/(.+)$/.exec(id);
+  return m ? store.get(m[1], m[2]) ?? null : null;
+}
+
+function doMergePull(repo: RepoRecord, pull: PullRecord): string | null {
+  if (pull.merged) return pull.mergeCommitSha;
+  const currentBase = repo.refs.get(`refs/heads/${pull.base}`);
+  if (currentBase !== pull.baseSha) return null;
+  const baseTip = currentBase;
+  const headCommit = repo.objects.get(pull.headSha);
+  if (!headCommit) return null;
+  const headParsed = parseCommit(headCommit.data);
+  const message = `Merge pull request #${pull.number} from ${pull.head}\n\n${pull.title}\n`;
+  const commitOid = putObject(repo, 'commit', buildCommit({
+    tree: headParsed.tree, parents: [baseTip], message,
+    author: `${AUTH_LOGIN} <${AUTH_LOGIN}@example.invalid> 1735689600 +0000`,
+    committer: `${AUTH_LOGIN} <${AUTH_LOGIN}@example.invalid> 1735689600 +0000`,
+  }));
+  repo.refs.set(`refs/heads/${pull.base}`, commitOid);
+  pull.merged = true; pull.state = 'closed'; pull.mergedAt = nowIso(); pull.mergeCommitSha = commitOid; pull.updatedAt = nowIso();
+  return commitOid;
+}
+
+/** A tiny executor for the fixed operation documents gh / github-mcp-server send (matched by name). */
 function execOneGraphQL(query: string, variables: Record<string, unknown>): { data?: unknown; errors?: Array<{ message: string }> } {
-  const isMutation = /^\s*mutation\b/.test(query);
-  const typeMatches = [...query.matchAll(/__type\s*\(\s*name:\s*"([^"]+)"\s*\)/g)];
-  if (typeMatches.length) {
-    const name = typeMatches[0][1];
-    const result = introspectType(name);
-    return { data: { __type: result } };
+  const nameMatch = /^\s*(?:query|mutation)\s+(\w+)/.exec(query);
+  const opName = nameMatch?.[1] ?? '';
+
+  if (opName === 'ViewerLogin') return { data: { viewer: { login: AUTH_LOGIN } } };
+  if (opName === 'ViewerInvalidField') return { data: { viewer: { login: AUTH_LOGIN } }, errors: [{ message: "Cannot query field \"noSuchFieldOnViewer\" on type \"User\"." }] };
+
+  if (opName === 'Issue_fields') return { data: { Issue: typeFieldsResult('Issue') } };
+  if (opName === 'PullRequestAndRepositoryFields') {
+    return { data: { PullRequest: typeFieldsResult('PullRequest'), Repository: typeFieldsResult('Repository') } };
   }
-  if (!isMutation) {
-    const repoMatch = /repository\s*\(\s*owner:\s*\$?(\w+)|owner:\s*"([^"]*)"/i.exec(query);
-    const ownerVar = (variables.owner as string) ?? repoMatch?.[2];
-    const nameVar = (variables.name as string) ?? /name:\s*"([^"]*)"/.exec(query)?.[1];
-    if (/repository\s*\(/.test(query)) {
-      const repo = ownerVar && nameVar ? gqlFindRepo(ownerVar, nameVar) : undefined;
-      if (!repo) return { data: { repository: null } };
-      const node = gqlRepoNode(repo) as Record<string, unknown>;
-      if (/issue\s*\(/.test(query) && typeof variables.number === 'number') {
-        const issue = repo.issues.get(variables.number as number);
-        node.issue = issue ? gqlIssueNode(repo, issue) : null;
-      }
-      if (/pullRequest\s*\(/.test(query) && typeof variables.number === 'number') {
-        const pull = repo.pulls.get(variables.number as number);
-        node.pullRequest = pull ? gqlPullNode(repo, pull) : null;
-      }
-      if (/issues\s*\(/.test(query)) {
-        const statesMatch = /states:\s*\[([A-Z, ]+)\]/.exec(query);
-        const wantOpen = statesMatch ? statesMatch[1].includes('OPEN') && !statesMatch[1].includes('CLOSED') : null;
-        let list = [...repo.issues.values()].filter((i) => !i.isPull);
-        if (wantOpen === true) list = list.filter((i) => i.state === 'open');
-        list.sort((a, b) => b.number - a.number);
-        node.issues = { nodes: list.map((i) => gqlIssueNode(repo, i)), totalCount: list.length };
-      }
-      if (/pullRequests\s*\(/.test(query)) {
-        const list = [...repo.pulls.values()].sort((a, b) => b.number - a.number);
-        node.pullRequests = { nodes: list.map((p) => gqlPullNode(repo, p)), totalCount: list.length };
-      }
-      return { data: { repository: node } };
-    }
-    if (/\bviewer\s*\{/.test(query)) return { data: { viewer: { login: AUTH_LOGIN } } };
-    const fieldMatch = /\{\s*(\w+)/.exec(query.replace(/^\s*query[^{]*/, ''));
-    if (fieldMatch) return { errors: [{ message: `Field '${fieldMatch[1]}' doesn't exist on type 'Query'` }] };
-    return { errors: [{ message: 'unrecognized query' }] };
+  if (opName === 'SearchType_enumValues') return { data: { SearchType: typeFieldsResult('SearchType') } };
+
+  if (opName === 'NodeRepository') {
+    const id = String(variables.id ?? '');
+    const repo = findRepoById(id);
+    if (!repo) return { data: { node: null } };
+    return { data: { node: { id: `repo:${repo.owner}/${repo.name}`, name: repo.name, nameWithOwner: `${repo.owner}/${repo.name}` } } };
   }
-  // mutation
-  if (/createPullRequest/.test(query)) {
-    const input = (variables.input as Record<string, unknown>) ?? variables;
-    const repoId = String(input.repositoryId ?? '');
-    const m = /^repo:([^/]+)\/(.+)$/.exec(repoId);
-    const repo = m ? gqlFindRepo(m[1], m[2]) : undefined;
+
+  if (opName === 'RepositoryFields') {
+    const owner = String(variables.owner ?? ''); const name = String(variables.name ?? '');
+    const repo = gqlFindRepo(owner, name);
+    return { data: { repository: repo ? gqlRepoNode(repo) : null } };
+  }
+  if (opName === 'OpenIssues') {
+    const owner = String(variables.owner ?? ''); const name = String(variables.name ?? '');
+    const repo = gqlFindRepo(owner, name);
+    if (!repo) return { data: { repository: null } };
+    const list = [...repo.issues.values()].filter((i) => !i.isPull && i.state === 'open').sort((a, b) => b.number - a.number);
+    return { data: { repository: { issues: { nodes: list.map((i) => gqlIssueNode(repo, i)) } } } };
+  }
+  if (opName === 'IssuesPage') {
+    const owner = String(variables.owner ?? ''); const name = String(variables.name ?? '');
+    const first = Number(variables.first ?? 10);
+    const after = variables.after != null ? Number(variables.after) : 0;
+    const repo = gqlFindRepo(owner, name);
+    if (!repo) return { data: { repository: null } };
+    const all = [...repo.issues.values()].filter((i) => !i.isPull).sort((a, b) => a.number - b.number);
+    const slice = all.slice(after, after + first);
+    const hasNext = after + first < all.length;
+    return {
+      data: {
+        repository: {
+          issues: {
+            nodes: slice.map((i) => ({ number: i.number })),
+            pageInfo: { hasNextPage: hasNext, endCursor: hasNext ? String(after + slice.length) : null },
+          },
+        },
+      },
+    };
+  }
+  if (opName === 'IssueByNumber') {
+    const owner = String(variables.owner ?? ''); const name = String(variables.name ?? ''); const number = Number(variables.number);
+    const repo = gqlFindRepo(owner, name);
+    if (!repo) return { data: { repository: null } };
+    const issue = repo.issues.get(number);
+    return { data: { repository: { issue: issue ? gqlIssueNode(repo, issue) : null } } };
+  }
+  if (opName === 'PullRequests') {
+    const owner = String(variables.owner ?? ''); const name = String(variables.name ?? '');
+    const repo = gqlFindRepo(owner, name);
+    if (!repo) return { data: { repository: null } };
+    const list = [...repo.pulls.values()].sort((a, b) => a.number - b.number);
+    return { data: { repository: { pullRequests: { nodes: list.map((p) => gqlPullNode(repo, p)) } } } };
+  }
+  if (opName === 'PullRequestFiles' || opName === 'PullRequestId') {
+    const owner = String(variables.owner ?? ''); const name = String(variables.name ?? ''); const number = Number(variables.number);
+    const repo = gqlFindRepo(owner, name);
+    if (!repo) return { data: { repository: null } };
+    const pull = repo.pulls.get(number);
+    return { data: { repository: { pullRequest: pull ? gqlPullNode(repo, pull) : null } } };
+  }
+
+  if (opName === 'IssueCreate') {
+    const input = (variables.input as Record<string, unknown>) ?? {};
+    const repo = findRepoById(String(input.repositoryId ?? ''));
+    if (!repo) return { errors: [{ message: 'Could not resolve to a Repository' }] };
+    const number = nextIssueNumber(repo);
+    const now = nowIso();
+    const issue: IssueRecord = { number, title: String(input.title ?? ''), body: String(input.body ?? ''), state: 'open', labels: [], createdAt: now, updatedAt: now, closedAt: null, comments: [], isPull: false };
+    repo.issues.set(number, issue);
+    return { data: { createIssue: { issue: { number, id: `issue:${repo.owner}/${repo.name}#${number}` } } } };
+  }
+  if (opName === 'IssueClose') {
+    const input = (variables.input as Record<string, unknown>) ?? {};
+    const found = findIssueById(String(input.issueId ?? ''));
+    if (!found) return { errors: [{ message: 'Could not resolve to an Issue' }] };
+    found.issue.state = 'closed'; found.issue.closedAt = nowIso(); found.issue.updatedAt = nowIso();
+    return { data: { closeIssue: { issue: { number: found.issue.number, id: String(input.issueId), state: 'CLOSED' } } } };
+  }
+  if (opName === 'PullRequestCreate') {
+    const input = (variables.input as Record<string, unknown>) ?? {};
+    const repo = findRepoById(String(input.repositoryId ?? ''));
     if (!repo) return { errors: [{ message: 'Could not resolve to a Repository' }] };
     const head = String(input.headRefName ?? '');
     const base = String(input.baseRefName ?? repo.defaultBranch);
@@ -877,14 +965,29 @@ function execOneGraphQL(query: string, variables: Record<string, unknown>): { da
     if (!headSha || !baseSha) return { errors: [{ message: 'head or base branch not found' }] };
     const number = nextIssueNumber(repo);
     const now = nowIso();
-    const pull: PullRecord = {
-      number, title: String(input.title ?? ''), body: String(input.body ?? ''), state: 'open', merged: false,
-      mergedAt: null, mergeCommitSha: null, head, base, headSha, baseSha, createdAt: now, updatedAt: now,
-    };
+    const pull: PullRecord = { number, title: String(input.title ?? ''), body: String(input.body ?? ''), state: 'open', merged: false, mergedAt: null, mergeCommitSha: null, head, base, headSha, baseSha, createdAt: now, updatedAt: now };
     repo.pulls.set(number, pull);
     return { data: { createPullRequest: { pullRequest: gqlPullNode(repo, pull) } } };
   }
-  return { errors: [{ message: 'unrecognized mutation' }] };
+  if (opName === 'MergePullRequest') {
+    const input = (variables.input as Record<string, unknown>) ?? {};
+    const found = findPullById(String(input.pullRequestId ?? ''));
+    if (!found) return { errors: [{ message: 'Could not resolve to a PullRequest' }] };
+    const sha = doMergePull(found.repo, found.pull);
+    if (!sha) return { errors: [{ message: 'Pull Request is not mergeable' }] };
+    return { data: { mergePullRequest: { pullRequest: { number: found.pull.number, merged: true, state: 'MERGED' } } } };
+  }
+  if (opName === 'AddComment') {
+    const input = (variables.input as Record<string, unknown>) ?? {};
+    const found = findIssueById(String(input.subjectId ?? ''));
+    if (!found) return { errors: [{ message: 'Could not resolve to an Issue' }] };
+    const commentBody = String(input.body ?? '');
+    const comment: CommentRecord = { id: 50000 + found.issue.comments.length + 1, body: commentBody, createdAt: nowIso() };
+    found.issue.comments.push(comment);
+    return { data: { addComment: { commentEdge: { node: { id: `comment:${found.repo.owner}/${found.repo.name}#${comment.id}`, body: comment.body } } } } };
+  }
+
+  return { errors: [{ message: `unrecognized operation ${JSON.stringify(opName)}` }] };
 }
 
 async function handleGraphQL(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1006,7 +1109,12 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
   }
   if (methodName === 'notifications/initialized') { res.writeHead(200, { 'content-type': JSON_TYPE }); res.end(); return; }
   if (methodName === 'server/discover' || methodName === 'discover') {
-    reply({ supportedVersions: ['2026-07-28', '2025-11-25'] });
+    reply({
+      supportedVersions: ['2026-07-28', '2025-11-25'],
+      serverInfo: { name: 'makefun-forge', version: '1.0.0' },
+      capabilities: { tools: {} },
+      _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'makefun-forge', version: '1.0.0' } },
+    });
     return;
   }
   if (methodName === 'tools/list') { reply({ tools: MCP_TOOLS }); return; }
